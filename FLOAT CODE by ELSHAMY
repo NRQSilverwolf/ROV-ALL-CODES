@@ -1,0 +1,700 @@
+/*
+  ROV FLOAT DEVICE - ESP32-S3 Mission Controller
+  Improved version with:
+    - validated sensor reads
+    - spike rejection
+    - low-pass filtered control depth
+    - stable-in-band target detection
+    - step position tracking
+    - software travel limits
+    - multi-speed approach
+    - sensor-fault failsafe
+*/
+
+#include <Wire.h>
+#include <RTClib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+#include "MS5837.h"
+
+// ---------------- PIN CONFIG ----------------
+#define DIR_PIN   4
+#define STEP_PIN  5
+#define EN_PIN    6
+
+#define I2C_SDA   8
+#define I2C_SCL   9
+
+// ---------------- USER CONFIG ----------------
+const char* TEAM_NAME = "YOUR_TEAM_NAME";
+
+// ESP32 access point
+const char* AP_SSID = "ROV_FLOAT_DEVICE";
+const char* AP_PASS = "rovfloat123";   // must be >= 8 chars
+
+// Freshwater density
+const float FLUID_DENSITY = 997.0f;    // kg/m^3
+
+// Mission depths (meters)
+const float DEPTH_DEEP_M    = 2.50f;
+const float DEPTH_SHALLOW_M = 0.40f;
+const float DEPTH_SURFACE_M = 0.00f;
+
+// Depth tolerance
+const float DEPTH_TOL_M = 0.30f;       // +-30 cm
+
+// To confirm a target is truly reached, depth must stay in band for this long
+const uint32_t IN_BAND_CONFIRM_MS = 3000UL;
+
+// Sensor position offset (meters)
+const float SENSOR_OFFSET_M = 0.00f;
+
+// Timing
+const uint32_t START_DELAY_MS      = 30000UL;
+const uint32_t HOLD_TIME_MS        = 30000UL;
+const uint32_t PHASE_TIMEOUT_MS    = 120000UL;
+const uint32_t LOG_INTERVAL_MS     = 1000UL;
+const uint32_t TELEMETRY_MS        = 1000UL;
+const uint32_t SURFACE_STABLE_MS   = 5000UL;
+
+// Stepper control
+const uint8_t SINK_DIR_LEVEL = HIGH;
+const uint8_t RISE_DIR_LEVEL = (SINK_DIR_LEVEL == HIGH) ? LOW : HIGH;
+
+// TMC2209 EN is typically active LOW
+const uint8_t DRIVER_ENABLE_LEVEL  = LOW;
+const uint8_t DRIVER_DISABLE_LEVEL = HIGH;
+
+// Step timing (smaller = faster)
+const uint32_t STEP_INTERVAL_FAST_US = 900;
+const uint32_t STEP_INTERVAL_MED_US  = 1800;
+const uint32_t STEP_INTERVAL_SLOW_US = 3500;
+
+// ----------- SOFTWARE TRAVEL LIMITS -----------
+// Since there are no endstops, we impose software-only bounds.
+// You MUST tune these after real testing.
+const long MIN_POSITION_STEPS = 0;        // most "rise / expel water" side
+const long MAX_POSITION_STEPS = 120000;   // most "sink / absorb water" side
+
+// ----------- SENSOR VALIDATION -----------
+// Adjust if needed after real sensor testing.
+const float MIN_PRESSURE_MBAR = 800.0f;
+const float MAX_PRESSURE_MBAR = 4000.0f;
+
+const float MIN_TEMP_C = 0.0f;
+const float MAX_TEMP_C = 60.0f;
+
+// Allowed mission depth range
+const float MIN_DEPTH_M = -0.20f;
+const float MAX_DEPTH_M = 10.0f;
+
+// Max allowed jump between consecutive accepted readings
+const float MAX_DEPTH_JUMP_M = 0.70f;
+const float MAX_TEMP_JUMP_C  = 5.0f;
+
+// If this many consecutive bad reads occur, go failsafe
+const uint8_t MAX_BAD_READINGS = 5;
+
+// ---------------- OBJECTS ----------------
+RTC_DS3231 rtc;
+MS5837 sensor;
+WebServer server(80);
+
+// ---------------- STATE MACHINE ----------------
+enum MissionState {
+  STATE_CALIBRATE,
+  STATE_WAIT_START,
+
+  STATE_GO_2P5_A,
+  STATE_HOLD_2P5_A,
+
+  STATE_GO_0P4_A,
+  STATE_HOLD_0P4_A,
+
+  STATE_GO_2P5_B,
+  STATE_HOLD_2P5_B,
+
+  STATE_GO_0P4_B,
+  STATE_HOLD_0P4_B,
+
+  STATE_RETURN_SURFACE,
+  STATE_COMPLETE,
+  STATE_FAILSAFE_RETURN
+};
+
+MissionState state = STATE_CALIBRATE;
+
+// ---------------- GLOBALS ----------------
+float surfaceDepthRaw = 0.0f;     // baseline depth from calibration
+
+// Raw accepted sensor values
+float lastPressureMbar = 0.0f;
+float lastTempC = 0.0f;
+float lastDepthRaw = 0.0f;
+
+// Control depth values
+float lastGoodDepth = 0.0f;
+float lastGoodTemp = 0.0f;
+float filteredDepth = 0.0f;
+
+// Sensor health
+bool sensorHealthy = true;
+uint8_t badReadingCount = 0;
+
+// Timing
+uint32_t stateStartMs = 0;
+uint32_t lastLogMs = 0;
+uint32_t lastTelemetryMs = 0;
+uint32_t inBandStartMs = 0;
+
+// Stepper
+bool driverEnabled = false;
+bool stepPinState = LOW;
+uint32_t lastStepToggleUs = 0;
+uint32_t currentStepIntervalUs = STEP_INTERVAL_SLOW_US;
+
+// Count only full rising edges as steps
+long motorPositionSteps = 0;
+
+// Logging / state labels
+String currentPhaseName = "INIT";
+bool missionGraphTag = false;
+
+// ---------------- HELPERS ----------------
+String twoDigits(int v) {
+  if (v < 10) return "0" + String(v);
+  return String(v);
+}
+
+String timeString(const DateTime& now) {
+  return String(now.year()) + "-" +
+         twoDigits(now.month()) + "-" +
+         twoDigits(now.day()) + " " +
+         twoDigits(now.hour()) + ":" +
+         twoDigits(now.minute()) + ":" +
+         twoDigits(now.second());
+}
+
+const char* stateName(MissionState s) {
+  switch (s) {
+    case STATE_CALIBRATE:       return "CALIBRATE";
+    case STATE_WAIT_START:      return "WAIT_START";
+    case STATE_GO_2P5_A:        return "GO_2P5_A";
+    case STATE_HOLD_2P5_A:      return "HOLD_2P5_A";
+    case STATE_GO_0P4_A:        return "GO_0P4_A";
+    case STATE_HOLD_0P4_A:      return "HOLD_0P4_A";
+    case STATE_GO_2P5_B:        return "GO_2P5_B";
+    case STATE_HOLD_2P5_B:      return "HOLD_2P5_B";
+    case STATE_GO_0P4_B:        return "GO_0P4_B";
+    case STATE_HOLD_0P4_B:      return "HOLD_0P4_B";
+    case STATE_RETURN_SURFACE:  return "RETURN_SURFACE";
+    case STATE_COMPLETE:        return "COMPLETE";
+    case STATE_FAILSAFE_RETURN: return "FAILSAFE_RETURN";
+    default:                    return "UNKNOWN";
+  }
+}
+
+void resetInBandTimer() {
+  inBandStartMs = 0;
+}
+
+void setDriver(bool enable) {
+  driverEnabled = enable;
+  digitalWrite(EN_PIN, enable ? DRIVER_ENABLE_LEVEL : DRIVER_DISABLE_LEVEL);
+}
+
+void stopMotor() {
+  setDriver(false);
+  digitalWrite(STEP_PIN, LOW);
+  stepPinState = LOW;
+}
+
+void setDirectionSink() {
+  digitalWrite(DIR_PIN, SINK_DIR_LEVEL);
+}
+
+void setDirectionRise() {
+  digitalWrite(DIR_PIN, RISE_DIR_LEVEL);
+}
+
+bool isWithinTolerance(float currentDepth, float targetDepth) {
+  return fabs(currentDepth - targetDepth) <= DEPTH_TOL_M;
+}
+
+bool isStableInBand(float currentDepth, float targetDepth) {
+  if (isWithinTolerance(currentDepth, targetDepth)) {
+    if (inBandStartMs == 0) {
+      inBandStartMs = millis();
+    }
+    return (millis() - inBandStartMs) >= IN_BAND_CONFIRM_MS;
+  } else {
+    inBandStartMs = 0;
+    return false;
+  }
+}
+
+bool timedOut() {
+  return (millis() - stateStartMs) > PHASE_TIMEOUT_MS;
+}
+
+bool holdDone() {
+  return (millis() - stateStartMs) > HOLD_TIME_MS;
+}
+
+bool startDelayDone() {
+  return (millis() - stateStartMs) > START_DELAY_MS;
+}
+
+bool surfaceStableDone() {
+  return (millis() - stateStartMs) > SURFACE_STABLE_MS;
+}
+
+// ---------------- SENSOR VALIDATION ----------------
+bool readSensorValidated() {
+  sensor.read();
+
+  float p = sensor.pressure();
+  float t = sensor.temperature();
+  float rawDepth = sensor.depth();  // library depth using FLUID_DENSITY
+  float deviceDepth = (rawDepth - surfaceDepthRaw) - SENSOR_OFFSET_M;
+
+  // Basic range checks
+  if (p < MIN_PRESSURE_MBAR || p > MAX_PRESSURE_MBAR) return false;
+  if (t < MIN_TEMP_C || t > MAX_TEMP_C) return false;
+  if (deviceDepth < MIN_DEPTH_M || deviceDepth > MAX_DEPTH_M) return false;
+
+  // Spike rejection against last accepted values
+  if (badReadingCount == 0 || sensorHealthy) {
+    if (fabs(deviceDepth - lastGoodDepth) > MAX_DEPTH_JUMP_M) return false;
+    if (fabs(t - lastGoodTemp) > MAX_TEMP_JUMP_C) return false;
+  }
+
+  // Accept reading
+  lastPressureMbar = p;
+  lastTempC = t;
+  lastDepthRaw = rawDepth;
+
+  lastGoodDepth = deviceDepth;
+  lastGoodTemp = t;
+
+  // Low-pass filter for control
+  const float alpha = 0.20f;
+  filteredDepth = alpha * deviceDepth + (1.0f - alpha) * filteredDepth;
+
+  badReadingCount = 0;
+  sensorHealthy = true;
+  return true;
+}
+
+void handleSensorRead() {
+  bool ok = readSensorValidated();
+
+  if (!ok) {
+    badReadingCount++;
+    if (badReadingCount >= MAX_BAD_READINGS) {
+      sensorHealthy = false;
+      Serial.println("Sensor fault: too many bad readings -> FAILSAFE_RETURN");
+      if (state != STATE_FAILSAFE_RETURN && state != STATE_COMPLETE) {
+        state = STATE_FAILSAFE_RETURN;
+        stateStartMs = millis();
+        currentPhaseName = "FAILSAFE_RETURN_SENSOR";
+        missionGraphTag = false;
+        resetInBandTimer();
+      }
+    }
+  }
+}
+
+// ---------------- LOGGING ----------------
+void appendLogRow(const char* recordType) {
+  DateTime now = rtc.now();
+
+  File f = LittleFS.open("/log.csv", FILE_APPEND);
+  if (!f) return;
+
+  f.print(TEAM_NAME);
+  f.print(",");
+  f.print(recordType);              // GRAPH or INFO
+  f.print(",");
+  f.print(stateName(state));        // phase
+  f.print(",");
+  f.print(lastPressureMbar, 2);
+  f.print(",");
+  f.print(filteredDepth, 3);
+  f.print(",");
+  f.print(lastTempC, 2);
+  f.print(",");
+  f.print(timeString(now));
+  f.print(",");
+  f.print(sensorHealthy ? "OK" : "FAULT");
+  f.print(",");
+  f.println(motorPositionSteps);
+
+  f.close();
+}
+
+void initLogFile() {
+  LittleFS.remove("/log.csv");
+  File f = LittleFS.open("/log.csv", FILE_WRITE);
+  if (!f) return;
+
+  f.println("team_name,record_type,phase,pressure_mbar,depth_m,temp_c,time,sensor_status,motor_steps");
+  f.close();
+}
+
+void printTelemetry() {
+  DateTime now = rtc.now();
+  Serial.print("[");
+  Serial.print(timeString(now));
+  Serial.print("] ");
+  Serial.print(stateName(state));
+  Serial.print(" | P=");
+  Serial.print(lastPressureMbar, 2);
+  Serial.print(" mbar | D=");
+  Serial.print(filteredDepth, 3);
+  Serial.print(" m | T=");
+  Serial.print(lastTempC, 2);
+  Serial.print(" C | Steps=");
+  Serial.print(motorPositionSteps);
+  Serial.print(" | Sensor=");
+  Serial.println(sensorHealthy ? "OK" : "FAULT");
+}
+
+// ---------------- STATE MANAGEMENT ----------------
+void changeState(MissionState newState, const String& phaseName, bool graphTag) {
+  state = newState;
+  stateStartMs = millis();
+  currentPhaseName = phaseName;
+  missionGraphTag = graphTag;
+  resetInBandTimer();
+
+  Serial.print("STATE -> ");
+  Serial.println(phaseName);
+
+  appendLogRow(graphTag ? "GRAPH" : "INFO");
+}
+
+// ---------------- MOTOR CONTROL ----------------
+void pulseStepIfDue(bool sinkingDirection) {
+  uint32_t nowUs = micros();
+  if ((uint32_t)(nowUs - lastStepToggleUs) >= currentStepIntervalUs) {
+    lastStepToggleUs = nowUs;
+    stepPinState = !stepPinState;
+    digitalWrite(STEP_PIN, stepPinState);
+
+    // Count only rising edges as one actual step
+    if (stepPinState == HIGH) {
+      if (sinkingDirection) {
+        motorPositionSteps++;
+      } else {
+        motorPositionSteps--;
+      }
+    }
+  }
+}
+
+void stepperControlToTarget(float targetDepth) {
+  float error = targetDepth - filteredDepth;
+  float absErr = fabs(error);
+
+  // Inside tolerance band -> stop
+  if (absErr <= DEPTH_TOL_M) {
+    stopMotor();
+    return;
+  }
+
+  bool goSink = (error > 0);
+
+  // Software travel limits
+  if (goSink && motorPositionSteps >= MAX_POSITION_STEPS) {
+    stopMotor();
+    Serial.println("Travel limit reached at MAX_POSITION_STEPS");
+    return;
+  }
+  if (!goSink && motorPositionSteps <= MIN_POSITION_STEPS) {
+    stopMotor();
+    Serial.println("Travel limit reached at MIN_POSITION_STEPS");
+    return;
+  }
+
+  setDriver(true);
+
+  if (goSink) {
+    setDirectionSink();
+  } else {
+    setDirectionRise();
+  }
+
+  // Multi-speed approach to reduce overshoot
+  if (absErr > 1.0f) {
+    currentStepIntervalUs = STEP_INTERVAL_FAST_US;
+  } else if (absErr > 0.5f) {
+    currentStepIntervalUs = STEP_INTERVAL_MED_US;
+  } else {
+    currentStepIntervalUs = STEP_INTERVAL_SLOW_US;
+  }
+
+  pulseStepIfDue(goSink);
+}
+
+void holdControlToTarget(float targetDepth) {
+  float error = targetDepth - filteredDepth;
+  float absErr = fabs(error);
+
+  // During hold, only correct gently
+  if (absErr <= DEPTH_TOL_M) {
+    stopMotor();
+    return;
+  }
+
+  bool goSink = (error > 0);
+
+  // Software travel limits
+  if (goSink && motorPositionSteps >= MAX_POSITION_STEPS) {
+    stopMotor();
+    return;
+  }
+  if (!goSink && motorPositionSteps <= MIN_POSITION_STEPS) {
+    stopMotor();
+    return;
+  }
+
+  setDriver(true);
+
+  if (goSink) {
+    setDirectionSink();
+  } else {
+    setDirectionRise();
+  }
+
+  // Only medium or slow during hold
+  if (absErr > 0.7f) {
+    currentStepIntervalUs = STEP_INTERVAL_MED_US;
+  } else {
+    currentStepIntervalUs = STEP_INTERVAL_SLOW_US;
+  }
+
+  pulseStepIfDue(goSink);
+}
+
+// ---------------- WIFI SERVER ----------------
+void setupWiFiServer() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("AP IP: ");
+  Serial.println(ip);
+
+  server.on("/", HTTP_GET, []() {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ROV Float Log</title></head><body>";
+    html += "<h2>ROV Float Device</h2>";
+    html += "<p>Mission state: ";
+    html += stateName(state);
+    html += "</p>";
+    html += "<p><a href='/log.csv'>Download CSV Log</a></p>";
+    html += "<p><a href='/status'>Status</a></p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/status", HTTP_GET, []() {
+    String json = "{";
+    json += "\"state\":\"" + String(stateName(state)) + "\",";
+    json += "\"pressure_mbar\":" + String(lastPressureMbar, 2) + ",";
+    json += "\"depth_m\":" + String(filteredDepth, 3) + ",";
+    json += "\"temp_c\":" + String(lastTempC, 2) + ",";
+    json += "\"sensor_status\":\"" + String(sensorHealthy ? "OK" : "FAULT") + "\",";
+    json += "\"motor_steps\":" + String(motorPositionSteps);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/log.csv", HTTP_GET, []() {
+    if (!LittleFS.exists("/log.csv")) {
+      server.send(404, "text/plain", "log.csv not found");
+      return;
+    }
+    File f = LittleFS.open("/log.csv", FILE_READ);
+    server.streamFile(f, "text/csv");
+    f.close();
+  });
+
+  server.begin();
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(EN_PIN, OUTPUT);
+
+  digitalWrite(STEP_PIN, LOW);
+  digitalWrite(DIR_PIN, LOW);
+  digitalWrite(EN_PIN, DRIVER_DISABLE_LEVEL);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed!");
+    while (1) delay(10);
+  }
+
+  initLogFile();
+  setupWiFiServer();
+
+  if (!rtc.begin()) {
+    Serial.println("RTC not found!");
+    while (1) delay(10);
+  }
+
+  if (!sensor.init()) {
+    Serial.println("Pressure sensor init failed!");
+    while (1) delay(10);
+  }
+
+  // Optional model selection if needed:
+  // sensor.setModel(MS5837::MS5837_30BA);
+  sensor.setFluidDensity(FLUID_DENSITY);
+
+  Serial.println("Calibrating surface baseline... keep device at surface.");
+
+  float sumDepth = 0.0f;
+  const int samples = 30;
+  for (int i = 0; i < samples; i++) {
+    sensor.read();
+    sumDepth += sensor.depth();
+    delay(200);
+  }
+
+  surfaceDepthRaw = sumDepth / samples;
+  filteredDepth = 0.0f;
+  lastGoodDepth = 0.0f;
+  lastGoodTemp = 25.0f;  // safe initial placeholder
+  motorPositionSteps = 0;
+
+  Serial.print("Surface depth baseline: ");
+  Serial.println(surfaceDepthRaw, 4);
+
+  changeState(STATE_WAIT_START, "WAIT_START", false);
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  server.handleClient();
+  handleSensorRead();
+
+  uint32_t nowMs = millis();
+
+  if (nowMs - lastTelemetryMs >= TELEMETRY_MS) {
+    lastTelemetryMs = nowMs;
+    printTelemetry();
+  }
+
+  if (nowMs - lastLogMs >= LOG_INTERVAL_MS) {
+    lastLogMs = nowMs;
+    appendLogRow(missionGraphTag ? "GRAPH" : "INFO");
+  }
+
+  switch (state) {
+    case STATE_WAIT_START:
+      stopMotor();
+      if (startDelayDone()) {
+        changeState(STATE_GO_2P5_A, "GO_2P5_A", true);
+      }
+      break;
+
+    case STATE_GO_2P5_A:
+      stepperControlToTarget(DEPTH_DEEP_M);
+      if (isStableInBand(filteredDepth, DEPTH_DEEP_M)) {
+        changeState(STATE_HOLD_2P5_A, "HOLD_2P5_A", true);
+      } else if (timedOut()) {
+        changeState(STATE_FAILSAFE_RETURN, "FAILSAFE_RETURN", false);
+      }
+      break;
+
+    case STATE_HOLD_2P5_A:
+      holdControlToTarget(DEPTH_DEEP_M);
+      if (holdDone()) {
+        changeState(STATE_GO_0P4_A, "GO_0P4_A", true);
+      }
+      break;
+
+    case STATE_GO_0P4_A:
+      stepperControlToTarget(DEPTH_SHALLOW_M);
+      if (isStableInBand(filteredDepth, DEPTH_SHALLOW_M)) {
+        changeState(STATE_HOLD_0P4_A, "HOLD_0P4_A", true);
+      } else if (timedOut()) {
+        changeState(STATE_FAILSAFE_RETURN, "FAILSAFE_RETURN", false);
+      }
+      break;
+
+    case STATE_HOLD_0P4_A:
+      holdControlToTarget(DEPTH_SHALLOW_M);
+      if (holdDone()) {
+        changeState(STATE_GO_2P5_B, "GO_2P5_B", true);
+      }
+      break;
+
+    case STATE_GO_2P5_B:
+      stepperControlToTarget(DEPTH_DEEP_M);
+      if (isStableInBand(filteredDepth, DEPTH_DEEP_M)) {
+        changeState(STATE_HOLD_2P5_B, "HOLD_2P5_B", true);
+      } else if (timedOut()) {
+        changeState(STATE_FAILSAFE_RETURN, "FAILSAFE_RETURN", false);
+      }
+      break;
+
+    case STATE_HOLD_2P5_B:
+      holdControlToTarget(DEPTH_DEEP_M);
+      if (holdDone()) {
+        changeState(STATE_GO_0P4_B, "GO_0P4_B", true);
+      }
+      break;
+
+    case STATE_GO_0P4_B:
+      stepperControlToTarget(DEPTH_SHALLOW_M);
+      if (isStableInBand(filteredDepth, DEPTH_SHALLOW_M)) {
+        changeState(STATE_HOLD_0P4_B, "HOLD_0P4_B", true);
+      } else if (timedOut()) {
+        changeState(STATE_FAILSAFE_RETURN, "FAILSAFE_RETURN", false);
+      }
+      break;
+
+    case STATE_HOLD_0P4_B:
+      holdControlToTarget(DEPTH_SHALLOW_M);
+      if (holdDone()) {
+        changeState(STATE_RETURN_SURFACE, "RETURN_SURFACE", false);
+      }
+      break;
+
+    case STATE_RETURN_SURFACE:
+      stepperControlToTarget(DEPTH_SURFACE_M);
+      if (isStableInBand(filteredDepth, DEPTH_SURFACE_M)) {
+        changeState(STATE_COMPLETE, "COMPLETE", false);
+      } else if (timedOut()) {
+        changeState(STATE_COMPLETE, "COMPLETE", false);
+      }
+      break;
+
+    case STATE_FAILSAFE_RETURN:
+      stepperControlToTarget(DEPTH_SURFACE_M);
+      if (isWithinTolerance(filteredDepth, DEPTH_SURFACE_M) || surfaceStableDone()) {
+        changeState(STATE_COMPLETE, "COMPLETE", false);
+      }
+      break;
+
+    case STATE_COMPLETE:
+      stopMotor();
+      break;
+
+    case STATE_CALIBRATE:
+    default:
+      stopMotor();
+      break;
+  }
+}
